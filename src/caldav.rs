@@ -345,11 +345,8 @@ impl CalDavClient {
     }
 
     /// Run a calendar-query REPORT with the given VEVENT filter body.
-    async fn calendar_query(&self, calendar: Url, event_filter: &str, expand: Option<(&str, &str)>) -> Result<Vec<CalendarObject>> {
-        let data = match expand {
-            Some((s, e)) => format!(r#"<c:calendar-data><c:expand start="{s}" end="{e}"/></c:calendar-data>"#),
-            None => "<c:calendar-data/>".to_string(),
-        };
+    async fn calendar_query(&self, calendar: Url, event_filter: &str) -> Result<Vec<CalendarObject>> {
+        let data = "<c:calendar-data/>";
         let body = format!(
             r#"<?xml version="1.0" encoding="utf-8"?><c:calendar-query xmlns:d="{NS_DAV}" xmlns:c="{NS_CALDAV}"><d:prop><d:getetag/>{data}</d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT">{event_filter}</c:comp-filter></c:comp-filter></c:filter></c:calendar-query>"#
         );
@@ -366,9 +363,11 @@ impl CalDavClient {
         Ok(out)
     }
 
-    pub async fn events_in_range(&self, calendar: Url, start: &str, end: &str, expand: bool) -> Result<Vec<CalendarObject>> {
+    /// Calendar objects with events overlapping the UTC range (YYYYMMDDTHHMMSSZ).
+    /// Recurring events are returned unexpanded (see `expand.rs`).
+    pub async fn events_in_range(&self, calendar: Url, start: &str, end: &str) -> Result<Vec<CalendarObject>> {
         let filter = format!(r#"<c:time-range start="{start}" end="{end}"/>"#);
-        self.calendar_query(calendar, &filter, expand.then_some((start, end))).await
+        self.calendar_query(calendar, &filter).await
     }
 
     pub async fn find_by_uid(&self, calendar: Url, uid: &str) -> Result<Option<CalendarObject>> {
@@ -376,7 +375,7 @@ impl CalDavClient {
             r#"<c:prop-filter name="UID"><c:text-match collation="i;octet">{}</c:text-match></c:prop-filter>"#,
             xml_escape(uid)
         );
-        Ok(self.calendar_query(calendar, &filter, None).await?.into_iter().next())
+        Ok(self.calendar_query(calendar, &filter).await?.into_iter().next())
     }
 
     pub async fn get(&self, url: Url) -> Result<CalendarObject> {

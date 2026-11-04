@@ -2,10 +2,12 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
+use chrono_tz::Tz;
 use serde_json::{Map, Value, json};
 use url::Url;
 
 use crate::caldav::{CalDavClient, CalendarObject, Precondition};
+use crate::expand;
 use crate::ical::{self, Component, Property, escape_text};
 
 pub struct Tools {
@@ -15,7 +17,7 @@ pub struct Tools {
 }
 
 const CALENDAR_ARG: &str = "Calendar URL (from list_calendars) or display name. Defaults to CALDAV_DEFAULT_CALENDAR or the first event calendar.";
-const TZ_ARG: &str = "IANA timezone (e.g. Europe/Berlin) for date-times given without an offset. Defaults to CALDAV_TIMEZONE; otherwise such times are 'floating'.";
+const TZ_ARG: &str = "IANA timezone (e.g. Europe/Berlin). Used for date-times given without an offset and for reporting results: returned times are converted to this zone with an explicit UTC offset. Defaults to CALDAV_TIMEZONE; without any timezone, times are reported in their stored zone.";
 
 fn event_field_schema() -> Map<String, Value> {
     let mut m = Map::new();
@@ -52,6 +54,7 @@ pub fn definitions() -> Value {
 
     let mut get = Map::new();
     locator_schema(&mut get);
+    get.insert("timezone".into(), json!({"type": "string", "description": TZ_ARG}));
     get.insert("include_raw".into(), json!({"type": "boolean", "description": "Include raw iCalendar data (default true)."}));
 
     let mut del = Map::new();
@@ -138,6 +141,13 @@ impl Tools {
         s(args, "timezone").filter(|t| !t.is_empty()).or(self.default_timezone.as_deref())
     }
 
+    /// Timezone used to report date-times.
+    fn display_tz(&self, args: &Value) -> Result<Option<Tz>> {
+        self.tz(args)
+            .map(|t| ical::parse_tz(t).ok_or_else(|| anyhow!("unknown timezone '{t}'")))
+            .transpose()
+    }
+
     async fn calendar(&self, args: &Value) -> Result<Url> {
         self.client.resolve_calendar(s(args, "calendar"), self.default_calendar.as_deref()).await
     }
@@ -145,6 +155,7 @@ impl Tools {
     async fn list_events(&self, args: &Value) -> Result<Value> {
         let cal = self.calendar(args).await?;
         let tz = self.tz(args);
+        let display = self.display_tz(args)?;
         let start = match s(args, "start") {
             Some(v) => ical::to_utc_range_value(v, tz)?,
             None => ical::utc_stamp(Utc::now()),
@@ -159,22 +170,42 @@ impl Tools {
         if end <= start {
             bail!("end must be after start");
         }
-        let expand = args.get("expand").and_then(Value::as_bool).unwrap_or(true);
+        let expand_recurring = args.get("expand").and_then(Value::as_bool).unwrap_or(true);
         let query = s(args, "query").map(str::to_lowercase).filter(|q| !q.is_empty());
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(200) as usize;
 
-        let objects = self.client.events_in_range(cal.clone(), &start, &end, expand).await?;
-        let mut events: Vec<(String, Value)> = Vec::new();
+        let range_start = parse_utc_stamp(&start)?;
+        let range_end = parse_utc_stamp(&end)?;
+        // Servers can mis-evaluate time ranges for odd TZIDs (by up to ±14h), so query a
+        // wider window and filter precisely after local expansion.
+        let objects = self
+            .client
+            .events_in_range(
+                cal.clone(),
+                &ical::utc_stamp(range_start - Duration::days(1)),
+                &ical::utc_stamp(range_end + Duration::days(1)),
+            )
+            .await?;
+        let mut events: Vec<(i64, Value)> = Vec::new();
         let mut parse_errors = Vec::new();
+        let mut warnings = Vec::new();
         for obj in &objects {
-            let root = match ical::parse(&obj.data) {
+            let mut root = match ical::parse(&obj.data) {
                 Ok(r) => r,
                 Err(e) => {
                     parse_errors.push(format!("{}: {e}", obj.url));
                     continue;
                 }
             };
-            for ev in root.children.iter().filter(|c| c.name == "VEVENT") {
+            expand::normalize_fixed_offsets(&mut root, display);
+            let items: Vec<Component> = if expand_recurring {
+                let (items, w) = expand::expand(&root, range_start, range_end, display);
+                warnings.extend(w);
+                items
+            } else {
+                root.children.into_iter().filter(|c| c.name == "VEVENT").collect()
+            };
+            for ev in &items {
                 if let Some(q) = &query {
                     let hay = ["SUMMARY", "DESCRIPTION", "LOCATION"]
                         .iter()
@@ -186,20 +217,20 @@ impl Tools {
                         continue;
                     }
                 }
-                let mut j = ical::event_to_json(ev);
+                let mut j = ical::event_to_json(ev, display);
                 j["event_url"] = json!(obj.url.as_str());
                 if let Some(e) = &obj.etag {
                     j["etag"] = json!(e);
                 }
-                events.push((ical::start_sort_key(ev), j));
+                events.push((ical::start_sort_key(ev, display), j));
             }
         }
-        events.sort_by(|a, b| a.0.cmp(&b.0));
+        events.sort_by_key(|e| e.0);
         let total = events.len();
         let events: Vec<Value> = events.into_iter().take(limit).map(|(_, j)| j).collect();
         let mut out = json!({
             "calendar": cal.as_str(),
-            "range": { "start": ical::format_dt_value(&start), "end": ical::format_dt_value(&end) },
+            "range": { "start": render_utc(&start, display), "end": render_utc(&end, display) },
             "count": events.len(),
             "events": events,
         });
@@ -208,6 +239,9 @@ impl Tools {
         }
         if !parse_errors.is_empty() {
             out["parse_errors"] = json!(parse_errors);
+        }
+        if !warnings.is_empty() {
+            out["warnings"] = json!(warnings);
         }
         Ok(out)
     }
@@ -233,8 +267,10 @@ impl Tools {
 
     async fn get_event(&self, args: &Value) -> Result<Value> {
         let obj = self.locate(args).await?;
-        let root = ical::parse(&obj.data)?;
-        let events: Vec<Value> = root.children.iter().filter(|c| c.name == "VEVENT").map(ical::event_to_json).collect();
+        let mut root = ical::parse(&obj.data)?;
+        let display = self.display_tz(args)?;
+        expand::normalize_fixed_offsets(&mut root, display);
+        let events: Vec<Value> = root.children.iter().filter(|c| c.name == "VEVENT").map(|e| ical::event_to_json(e, display)).collect();
         let mut out = json!({ "event_url": obj.url.as_str(), "etag": obj.etag, "events": events });
         if args.get("include_raw").and_then(Value::as_bool).unwrap_or(true) {
             out["ics"] = json!(obj.data);
@@ -270,7 +306,7 @@ impl Tools {
             "created": true,
             "event_url": url.as_str(),
             "etag": etag,
-            "event": ical::event_to_json(&root.children[0]),
+            "event": ical::event_to_json(&root.children[0], self.display_tz(args)?),
         }))
     }
 
@@ -287,7 +323,7 @@ impl Tools {
         let now = ical::utc_stamp(Utc::now());
         ev.set(Property::new("DTSTAMP", now.clone()));
         ev.set(Property::new("LAST-MODIFIED", now));
-        let event_json = ical::event_to_json(ev);
+        let event_json = ical::event_to_json(ev, self.display_tz(args)?);
 
         let etag = s(args, "etag").map(str::to_string).or(obj.etag.clone());
         let pre = match &etag {
@@ -428,6 +464,17 @@ impl Tools {
         }
         Ok(())
     }
+}
+
+fn parse_utc_stamp(stamp: &str) -> Result<chrono::DateTime<Utc>> {
+    Ok(NaiveDateTime::parse_from_str(stamp.trim_end_matches('Z'), "%Y%m%dT%H%M%S")?.and_utc())
+}
+
+/// Render a UTC stamp (YYYYMMDDTHHMMSSZ) in the display timezone.
+fn render_utc(stamp: &str, display: Option<Tz>) -> String {
+    ical::IcalTime::from_property(&Property::new("X", stamp))
+        .map(|t| t.render(display).0)
+        .unwrap_or_else(|| stamp.to_string())
 }
 
 /// Parse an iCalendar DATE or DATE-TIME value; returns (datetime, is_date).

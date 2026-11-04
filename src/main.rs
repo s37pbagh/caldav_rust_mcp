@@ -9,6 +9,7 @@
 //!   CALDAV_TIMEZONE          default IANA timezone for local date-times
 
 mod caldav;
+mod expand;
 mod ical;
 mod tools;
 
@@ -34,7 +35,7 @@ fn build_tools() -> Result<Tools> {
         (None, None) => Auth::None,
     };
     if let Some(tz) = env("CALDAV_TIMEZONE") {
-        tz.parse::<chrono_tz::Tz>().map_err(|_| anyhow::anyhow!("CALDAV_TIMEZONE '{tz}' is not a valid IANA timezone"))?;
+        ical::parse_tz(&tz).ok_or_else(|| anyhow::anyhow!("CALDAV_TIMEZONE '{tz}' is not a valid IANA timezone"))?;
     }
     Ok(Tools {
         client: CalDavClient::new(Config { base_url, auth })?,

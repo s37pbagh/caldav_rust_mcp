@@ -63,6 +63,13 @@ Claude Desktop (`claude_desktop_config.json`):
 }
 ```
 
+## Timezones
+
+- Results are reported in `timezone` (tool argument) or `CALDAV_TIMEZONE`, with an explicit UTC offset, e.g. `2026-11-04T17:30:00+01:00`. All-day events stay plain dates; floating times stay unshifted.
+- Recurring events are expanded by this server, not the CalDAV server. The CalDAV server's own expansion breaks with non-IANA zone names: Nextcloud treats `TZID=UTC+02:00` as UTC.
+- Fixed-offset zone names such as `UTC+02:00` (written by e.g. the Nextcloud Google bridge) are read as your configured timezone when the offset is one it uses. That way a weekly 17:30 event stays at 17:30 after DST changes. Other offsets are converted exactly.
+- Windows zone names (`W. Europe Standard Time`) and vendor-prefixed IANA names (`/mozilla.org/.../Europe/Berlin`) are recognised.
+
 ## Notes
 
 - Local times are written as `DTSTART;TZID=<IANA zone>` without an embedded `VTIMEZONE`. Common servers accept this, and Radicale and Nextcloud fill in the definition themselves.
