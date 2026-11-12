@@ -43,8 +43,10 @@ pub struct Calendar {
 }
 
 impl Calendar {
-    pub fn supports_events(&self) -> bool {
-        self.components.is_empty() || self.components.iter().any(|c| c == "VEVENT")
+    /// Whether the calendar accepts this component type (VEVENT, VTODO, ...).
+    /// Servers that do not advertise a component set accept everything.
+    pub fn supports(&self, component: &str) -> bool {
+        self.components.is_empty() || self.components.iter().any(|c| c.eq_ignore_ascii_case(component))
     }
 }
 
@@ -319,18 +321,42 @@ impl CalDavClient {
     }
 
     /// Resolve a calendar reference: a URL/path, a display name, or None for the default.
-    pub async fn resolve_calendar(&self, reference: Option<&str>, default: Option<&str>) -> Result<Url> {
-        let reference = reference.filter(|s| !s.trim().is_empty()).or(default);
+    /// `defaults` are tried in order; a default is skipped when it is a known calendar that
+    /// does not support `component`. Without a usable default, the first calendar supporting
+    /// `component` is used.
+    pub async fn resolve_calendar(&self, reference: Option<&str>, defaults: &[Option<&str>], component: &str) -> Result<Url> {
+        let explicit = reference.filter(|s| !s.trim().is_empty());
+        let mut cals: Option<Vec<Calendar>> = None;
+        let reference = match explicit {
+            Some(r) => Some(r),
+            None => {
+                let mut chosen = None;
+                for d in defaults.iter().flatten().filter(|d| !d.trim().is_empty()) {
+                    if cals.is_none() {
+                        cals = Some(self.list_calendars().await?);
+                    }
+                    let known = cals.as_ref().unwrap().iter().find(|c| calendar_matches(c, d));
+                    if known.is_none_or(|c| c.supports(component)) {
+                        chosen = Some(*d);
+                        break;
+                    }
+                }
+                chosen
+            }
+        };
         if let Some(r) = reference
             && (r.starts_with("http://") || r.starts_with("https://") || r.starts_with('/')) {
                 return Ok(as_collection(self.resolve(r)?));
             }
-        let cals = self.list_calendars().await?;
+        let cals = match cals {
+            Some(c) => c,
+            None => self.list_calendars().await?,
+        };
         match reference {
             Some(r) => cals
                 .iter()
                 .find(|c| c.name.eq_ignore_ascii_case(r))
-                .or_else(|| cals.iter().find(|c| c.url.trim_end_matches('/').ends_with(&format!("/{}", r.trim_matches('/')))))
+                .or_else(|| cals.iter().find(|c| calendar_matches(c, r)))
                 .map(|c| Url::parse(&c.url).unwrap())
                 .ok_or_else(|| {
                     let names: Vec<_> = cals.iter().map(|c| c.name.as_str()).collect();
@@ -338,17 +364,19 @@ impl CalDavClient {
                 }),
             None => cals
                 .iter()
-                .find(|c| c.supports_events())
+                .find(|c| c.supports(component))
                 .map(|c| Url::parse(&c.url).unwrap())
-                .ok_or_else(|| anyhow!("no calendar supporting events was found")),
+                .ok_or_else(|| anyhow!("no calendar supporting {component} was found")),
         }
     }
 
-    /// Run a calendar-query REPORT with the given VEVENT filter body.
-    async fn calendar_query(&self, calendar: Url, event_filter: &str) -> Result<Vec<CalendarObject>> {
+    /// Run a calendar-query REPORT for objects containing `component` (VEVENT, VTODO)
+    /// matching the given filter body.
+    async fn calendar_query(&self, calendar: Url, component: &str, filter: &str) -> Result<Vec<CalendarObject>> {
         let data = "<c:calendar-data/>";
         let body = format!(
-            r#"<?xml version="1.0" encoding="utf-8"?><c:calendar-query xmlns:d="{NS_DAV}" xmlns:c="{NS_CALDAV}"><d:prop><d:getetag/>{data}</d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT">{event_filter}</c:comp-filter></c:comp-filter></c:filter></c:calendar-query>"#
+            r#"<?xml version="1.0" encoding="utf-8"?><c:calendar-query xmlns:d="{NS_DAV}" xmlns:c="{NS_CALDAV}"><d:prop><d:getetag/>{data}</d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="{}">{filter}</c:comp-filter></c:comp-filter></c:filter></c:calendar-query>"#,
+            xml_escape(component)
         );
         let resps = self.dav("REPORT", calendar.clone(), "1", &body).await?;
         let mut out = Vec::new();
@@ -367,15 +395,21 @@ impl CalDavClient {
     /// Recurring events are returned unexpanded (see `expand.rs`).
     pub async fn events_in_range(&self, calendar: Url, start: &str, end: &str) -> Result<Vec<CalendarObject>> {
         let filter = format!(r#"<c:time-range start="{start}" end="{end}"/>"#);
-        self.calendar_query(calendar, &filter).await
+        self.calendar_query(calendar, "VEVENT", &filter).await
     }
 
-    pub async fn find_by_uid(&self, calendar: Url, uid: &str) -> Result<Option<CalendarObject>> {
+    /// All calendar objects containing tasks (VTODO). Filtering happens client-side.
+    pub async fn all_tasks(&self, calendar: Url) -> Result<Vec<CalendarObject>> {
+        self.calendar_query(calendar, "VTODO", "").await
+    }
+
+    /// Find the object whose `component` (VEVENT, VTODO, ...) has this UID.
+    pub async fn find_by_uid(&self, calendar: Url, component: &str, uid: &str) -> Result<Option<CalendarObject>> {
         let filter = format!(
             r#"<c:prop-filter name="UID"><c:text-match collation="i;octet">{}</c:text-match></c:prop-filter>"#,
             xml_escape(uid)
         );
-        Ok(self.calendar_query(calendar, &filter).await?.into_iter().next())
+        Ok(self.calendar_query(calendar, component, &filter).await?.into_iter().next())
     }
 
     pub async fn get(&self, url: Url) -> Result<CalendarObject> {
@@ -396,10 +430,10 @@ impl CalDavClient {
         let resp = self.request(Method::PUT, url.clone(), &headers, Some((data, "text/calendar; charset=utf-8"))).await?;
         if resp.status == StatusCode::PRECONDITION_FAILED {
             bail!(
-                "PUT {url}: precondition failed ({}). Fetch the event again and retry.",
+                "PUT {url}: precondition failed ({}). Fetch it again and retry.",
                 match pre {
-                    Precondition::MustNotExist => "an event already exists at this URL",
-                    _ => "the event was modified by someone else (etag mismatch)",
+                    Precondition::MustNotExist => "an object already exists at this URL",
+                    _ => "it was modified by someone else (etag mismatch)",
                 }
             );
         }
@@ -417,6 +451,13 @@ impl CalDavClient {
         }
         Ok(())
     }
+}
+
+/// Whether a calendar reference (display name, URL or path suffix) names this calendar.
+fn calendar_matches(c: &Calendar, r: &str) -> bool {
+    c.name.eq_ignore_ascii_case(r)
+        || c.url.trim_end_matches('/') == r.trim_end_matches('/')
+        || c.url.trim_end_matches('/').ends_with(&format!("/{}", r.trim_matches('/')))
 }
 
 fn etag_header(h: &header::HeaderMap) -> Option<String> {

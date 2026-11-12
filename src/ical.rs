@@ -1,5 +1,5 @@
 //! Minimal iCalendar (RFC 5545) parser/serializer, sufficient for reading and
-//! editing VEVENTs without losing unknown properties or components.
+//! editing VEVENTs and VTODOs without losing unknown properties or components.
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -324,50 +324,49 @@ pub fn to_utc_range_value(input: &str, timezone: Option<&str>) -> Result<String>
     Ok(utc_stamp(utc))
 }
 
-/// Convert a VEVENT into a JSON object for tool output.
-/// `display` is the timezone in which date-times are reported (None = keep each value's own zone).
-pub fn event_to_json(ev: &Component, display: Option<Tz>) -> Value {
+/// Insert `k` when `v` is a non-empty string.
+fn put(m: &mut Map<String, Value>, k: &str, v: Option<String>) {
+    if let Some(v) = v
+        && !v.is_empty()
+    {
+        m.insert(k.to_string(), Value::String(v));
+    }
+}
+
+/// Fields shared by VEVENT and VTODO.
+fn common_fields(c: &Component, display: Option<Tz>) -> Map<String, Value> {
     let mut m = Map::new();
-    let mut put = |k: &str, v: Option<String>| {
-        if let Some(v) = v
-            && !v.is_empty() {
-                m.insert(k.to_string(), Value::String(v));
-            }
-    };
-    put("uid", ev.prop("UID").map(|p| p.value.clone()));
-    put("summary", ev.text("SUMMARY"));
-    put("description", ev.text("DESCRIPTION"));
-    put("location", ev.text("LOCATION"));
-    put("status", ev.prop("STATUS").map(|p| p.value.clone()));
-    put("rrule", ev.prop("RRULE").map(|p| p.value.clone()));
-    put("recurrence_id", ev.prop("RECURRENCE-ID").and_then(IcalTime::from_property).map(|t| t.render(display).0));
-    put("duration", ev.prop("DURATION").map(|p| p.value.clone()));
-    put("url", ev.prop("URL").map(|p| p.value.clone()));
-    put("organizer", ev.prop("ORGANIZER").map(|p| strip_mailto(&p.value)));
-    let start = ev.prop("DTSTART").and_then(IcalTime::from_property);
-    let end = ev.prop("DTEND").and_then(IcalTime::from_property).or_else(|| {
-        // Derive the end from DURATION, or the RFC 5545 default (one day for all-day events).
-        let st = start.as_ref()?;
-        match ev.prop("DURATION") {
-            Some(d) => parse_duration(&d.value).map(|d| st.add(d)),
-            None => matches!(st, IcalTime::Date(_)).then(|| st.add(Duration::days(1))),
-        }
-    });
-    for (key, t) in [("start", start), ("end", end)] {
-        if let Some(t) = t {
-            let (text, tz) = t.render(display);
-            m.insert(key.to_string(), Value::String(text));
-            if let Some(tz) = tz {
-                m.insert(format!("{key}_timezone"), Value::String(tz));
-            }
+    put(&mut m, "uid", c.prop("UID").map(|p| p.value.clone()));
+    put(&mut m, "summary", c.text("SUMMARY"));
+    put(&mut m, "description", c.text("DESCRIPTION"));
+    put(&mut m, "location", c.text("LOCATION"));
+    put(&mut m, "status", c.prop("STATUS").map(|p| p.value.clone()));
+    put(&mut m, "rrule", c.prop("RRULE").map(|p| p.value.clone()));
+    put(&mut m, "recurrence_id", c.prop("RECURRENCE-ID").and_then(IcalTime::from_property).map(|t| t.render(display).0));
+    put(&mut m, "duration", c.prop("DURATION").map(|p| p.value.clone()));
+    put(&mut m, "url", c.prop("URL").map(|p| p.value.clone()));
+    put(&mut m, "organizer", c.prop("ORGANIZER").map(|p| strip_mailto(&p.value)));
+    m
+}
+
+/// Insert `key` (and `key_timezone`) for a rendered time.
+fn put_time(m: &mut Map<String, Value>, key: &str, t: Option<IcalTime>, display: Option<Tz>) {
+    if let Some(t) = t {
+        let (text, tz) = t.render(display);
+        m.insert(key.to_string(), Value::String(text));
+        if let Some(tz) = tz {
+            m.insert(format!("{key}_timezone"), Value::String(tz));
         }
     }
-    let all_day = ev
-        .prop("DTSTART")
-        .map(|p| p.param("VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE")) || p.value.trim().len() == 8)
-        .unwrap_or(false);
-    m.insert("all_day".into(), Value::Bool(all_day));
-    let attendees: Vec<Value> = ev
+}
+
+fn is_date_prop(p: &Property) -> bool {
+    p.param("VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE")) || p.value.trim().len() == 8
+}
+
+/// Attendees, categories and reminders, shared by VEVENT and VTODO.
+fn list_fields(c: &Component, m: &mut Map<String, Value>) {
+    let attendees: Vec<Value> = c
         .props_named("ATTENDEE")
         .map(|p| {
             let mut a = json!({ "email": strip_mailto(&p.value) });
@@ -383,23 +382,93 @@ pub fn event_to_json(ev: &Component, display: Option<Tz>) -> Value {
     if !attendees.is_empty() {
         m.insert("attendees".into(), Value::Array(attendees));
     }
-    let categories: Vec<String> = ev
-        .props_named("CATEGORIES")
-        .flat_map(|p| split_text_list(&p.value))
-        .collect();
+    let categories: Vec<String> = c.props_named("CATEGORIES").flat_map(|p| split_text_list(&p.value)).collect();
     if !categories.is_empty() {
         m.insert("categories".into(), json!(categories));
     }
-    let reminders: Vec<String> = ev
+    let reminders: Vec<String> = c
         .children
         .iter()
-        .filter(|c| c.name == "VALARM")
-        .filter_map(|c| c.prop("TRIGGER").map(|p| p.value.clone()))
+        .filter(|a| a.name == "VALARM")
+        .filter_map(|a| a.prop("TRIGGER"))
+        .map(|p| match p.param("RELATED") {
+            Some(r) if r.eq_ignore_ascii_case("END") => format!("{} (before end/due)", p.value),
+            _ => p.value.clone(),
+        })
         .collect();
     if !reminders.is_empty() {
         m.insert("reminders".into(), json!(reminders));
     }
+}
+
+/// Convert a VEVENT into a JSON object for tool output.
+/// `display` is the timezone in which date-times are reported (None = keep each value's own zone).
+pub fn event_to_json(ev: &Component, display: Option<Tz>) -> Value {
+    let mut m = common_fields(ev, display);
+    let start = ev.prop("DTSTART").and_then(IcalTime::from_property);
+    let end = ev.prop("DTEND").and_then(IcalTime::from_property).or_else(|| {
+        // Derive the end from DURATION, or the RFC 5545 default (one day for all-day events).
+        let st = start.as_ref()?;
+        match ev.prop("DURATION") {
+            Some(d) => parse_duration(&d.value).map(|d| st.add(d)),
+            None => matches!(st, IcalTime::Date(_)).then(|| st.add(Duration::days(1))),
+        }
+    });
+    put_time(&mut m, "start", start, display);
+    put_time(&mut m, "end", end, display);
+    m.insert("all_day".into(), Value::Bool(ev.prop("DTSTART").is_some_and(is_date_prop)));
+    list_fields(ev, &mut m);
     Value::Object(m)
+}
+
+/// The due time of a VTODO: DUE, or DTSTART + DURATION.
+pub fn task_due(todo: &Component) -> Option<IcalTime> {
+    todo.prop("DUE").and_then(IcalTime::from_property).or_else(|| {
+        let st = todo.prop("DTSTART").and_then(IcalTime::from_property)?;
+        parse_duration(&todo.prop("DURATION")?.value).map(|d| st.add(d))
+    })
+}
+
+/// Whether a VTODO is finished (completed or cancelled).
+pub fn task_done(todo: &Component) -> bool {
+    todo.prop("COMPLETED").is_some()
+        || todo
+            .prop("STATUS")
+            .is_some_and(|p| ["COMPLETED", "CANCELLED"].iter().any(|s| p.value.trim().eq_ignore_ascii_case(s)))
+}
+
+/// Convert a VTODO into a JSON object for tool output.
+pub fn task_to_json(todo: &Component, display: Option<Tz>) -> Value {
+    let mut m = common_fields(todo, display);
+    m.remove("duration");
+    put_time(&mut m, "start", todo.prop("DTSTART").and_then(IcalTime::from_property), display);
+    put_time(&mut m, "due", task_due(todo), display);
+    m.insert("completed".into(), Value::Bool(task_done(todo) && !is_cancelled(todo)));
+    put_time(&mut m, "completed_at", todo.prop("COMPLETED").and_then(IcalTime::from_property), display);
+    if let Some(p) = todo.prop("PRIORITY").and_then(|p| p.value.trim().parse::<u8>().ok()).filter(|p| *p > 0) {
+        m.insert("priority".into(), json!(p));
+    }
+    if let Some(p) = todo.prop("PERCENT-COMPLETE").and_then(|p| p.value.trim().parse::<u8>().ok()) {
+        m.insert("percent_complete".into(), json!(p));
+    }
+    let parent = todo
+        .props_named("RELATED-TO")
+        .find(|p| p.param("RELTYPE").is_none_or(|t| t.eq_ignore_ascii_case("PARENT")))
+        .map(|p| p.value.clone());
+    put(&mut m, "parent_uid", parent);
+    let all_day = todo.prop("DUE").or(todo.prop("DTSTART")).is_some_and(is_date_prop);
+    m.insert("all_day".into(), Value::Bool(all_day));
+    list_fields(todo, &mut m);
+    Value::Object(m)
+}
+
+fn is_cancelled(todo: &Component) -> bool {
+    todo.prop("STATUS").is_some_and(|p| p.value.trim().eq_ignore_ascii_case("CANCELLED"))
+}
+
+/// Chronological sort key of a VTODO's due time (tasks without one sort last).
+pub fn due_sort_key(todo: &Component, display: Option<Tz>) -> i64 {
+    task_due(todo).map(|t| t.instant(display).timestamp()).unwrap_or(i64::MAX)
 }
 
 fn split_text_list(v: &str) -> Vec<String> {
@@ -471,7 +540,7 @@ impl IcalTime {
         })
     }
 
-    fn add(&self, d: Duration) -> Self {
+    pub fn add(&self, d: Duration) -> Self {
         match self {
             Self::Date(x) => Self::Date(*x + Duration::days(d.num_days())),
             Self::Utc(x) => Self::Utc(*x + d),

@@ -6,6 +6,7 @@
 //!   CALDAV_PASSWORD          password / app password for HTTP Basic auth
 //!   CALDAV_TOKEN             bearer token (alternative to username/password)
 //!   CALDAV_DEFAULT_CALENDAR  default calendar name or URL
+//!   CALDAV_DEFAULT_TASK_LIST default calendar for tasks (VTODO)
 //!   CALDAV_TIMEZONE          default IANA timezone for local date-times
 
 mod caldav;
@@ -40,6 +41,7 @@ fn build_tools() -> Result<Tools> {
     Ok(Tools {
         client: CalDavClient::new(Config { base_url, auth })?,
         default_calendar: env("CALDAV_DEFAULT_CALENDAR"),
+        default_task_list: env("CALDAV_DEFAULT_TASK_LIST"),
         default_timezone: env("CALDAV_TIMEZONE"),
     })
 }
@@ -102,7 +104,7 @@ async fn handle(tools: &Tools, msg: Value) -> Option<Value> {
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "caldav_mcp", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "Tools for reading and writing calendar events over CalDAV. Call list_calendars first to discover calendars; list_events returns event_url values that get_event/update_event/delete_event accept."
+                "instructions": "Tools for reading and writing calendar events and tasks (to-dos) over CalDAV. Call list_calendars first to discover calendars (components shows whether a calendar holds events, VEVENT, and/or tasks, VTODO). list_events returns event_url values that get_event/update_event/delete_event accept; list_tasks returns task_url values that get_task/update_task/delete_task accept."
             })
         }
         "ping" => json!({}),
