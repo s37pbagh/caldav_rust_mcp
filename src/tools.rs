@@ -15,6 +15,8 @@ pub struct Tools {
     pub default_calendar: Option<String>,
     pub default_task_list: Option<String>,
     pub default_timezone: Option<String>,
+    /// Nextcloud Deck client; `None` disables the deck_* tools.
+    pub deck: Option<crate::deck::DeckClient>,
 }
 
 /// The kind of calendar object a tool works on.
@@ -32,7 +34,7 @@ const TASK: Kind = Kind { comp: "VTODO", url_key: "task_url", noun: "task" };
 
 const CALENDAR_ARG: &str = "Calendar URL (from list_calendars) or display name. Defaults to CALDAV_DEFAULT_CALENDAR or the first event calendar.";
 const TASK_LIST_ARG: &str = "Calendar / task list URL (from list_calendars) or display name. Defaults to CALDAV_DEFAULT_TASK_LIST, then CALDAV_DEFAULT_CALENDAR if it supports tasks, then the first calendar that supports tasks (VTODO).";
-const TZ_ARG: &str = "IANA timezone (e.g. Europe/Berlin). Used for date-times given without an offset and for reporting results: returned times are converted to this zone with an explicit UTC offset. Defaults to CALDAV_TIMEZONE; without any timezone, times are reported in their stored zone.";
+pub(crate) const TZ_ARG: &str = "IANA timezone (e.g. Europe/Berlin). Used for date-times given without an offset and for reporting results: returned times are converted to this zone with an explicit UTC offset. Defaults to CALDAV_TIMEZONE; without any timezone, times are reported in their stored zone.";
 
 fn event_field_schema() -> Map<String, Value> {
     let mut m = Map::new();
@@ -79,7 +81,8 @@ fn locator_schema(m: &mut Map<String, Value>, kind: Kind) {
     m.insert("calendar".into(), json!({"type": "string", "description": cal_arg}));
 }
 
-pub fn definitions() -> Value {
+/// Tool definitions; the deck_* tools are included only when Deck is configured.
+pub fn definitions(deck: bool) -> Value {
     let mut create = event_field_schema();
     create.insert("calendar".into(), json!({"type": "string", "description": CALENDAR_ARG}));
     create.insert("uid".into(), json!({"type": "string", "description": "Optional UID; generated if omitted."}));
@@ -114,7 +117,7 @@ pub fn definitions() -> Value {
     locator_schema(&mut del_task, TASK);
     del_task.insert("etag".into(), json!({"type": "string", "description": "Only delete if the task still has this etag."}));
 
-    json!([
+    let mut tools = json!([
         {
             "name": "list_calendars",
             "description": "List the user's CalDAV calendars with URL, name, color and supported component types.",
@@ -202,7 +205,11 @@ pub fn definitions() -> Value {
                 "overwrite": {"type": "boolean", "description": "Replace an existing object with the same UID (default false)."}
             }, "required": ["ics"]}
         }
-    ])
+    ]);
+    if deck && let Some(list) = tools.as_array_mut() {
+        list.extend(crate::deck_tools::definitions());
+    }
+    tools
 }
 
 fn s<'a>(args: &'a Value, k: &str) -> Option<&'a str> {
@@ -227,16 +234,17 @@ impl Tools {
             "create_task" => self.create_task(args).await,
             "update_task" => self.update_task(args).await,
             "delete_task" => self.delete(args, TASK).await,
+            n if n.starts_with("deck_") => self.call_deck(n, args).await,
             other => bail!("unknown tool '{other}'"),
         }
     }
 
-    fn tz<'a>(&'a self, args: &'a Value) -> Option<&'a str> {
+    pub(crate) fn tz<'a>(&'a self, args: &'a Value) -> Option<&'a str> {
         s(args, "timezone").filter(|t| !t.is_empty()).or(self.default_timezone.as_deref())
     }
 
     /// Timezone used to report date-times.
-    fn display_tz(&self, args: &Value) -> Result<Option<Tz>> {
+    pub(crate) fn display_tz(&self, args: &Value) -> Result<Option<Tz>> {
         self.tz(args)
             .map(|t| ical::parse_tz(t).ok_or_else(|| anyhow!("unknown timezone '{t}'")))
             .transpose()
@@ -865,6 +873,7 @@ mod tests {
             default_calendar: None,
             default_task_list: None,
             default_timezone: Some("Europe/Berlin".into()),
+            deck: None,
         }
     }
 
@@ -896,6 +905,22 @@ mod tests {
 
         t.apply_task_fields(todo, &json!({"due": "", "priority": 0})).unwrap();
         assert!(todo.prop("DUE").is_none() && todo.prop("PRIORITY").is_none());
+    }
+
+    #[test]
+    fn deck_tools_only_when_configured() {
+        let names = |deck: bool| -> Vec<String> {
+            definitions(deck).as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+        };
+        let without = names(false);
+        assert!(without.iter().all(|n| !n.starts_with("deck_")));
+        let with = names(true);
+        assert_eq!(with.len(), without.len() + 7);
+        assert!(with.contains(&"deck_move_card".to_string()));
+
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let err = rt.block_on(tools().call("deck_list_boards", &json!({}))).unwrap_err().to_string();
+        assert!(err.contains("NEXTCLOUD_URL"), "{err}");
     }
 
     #[test]

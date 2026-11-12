@@ -19,6 +19,22 @@ An [MCP](https://modelcontextprotocol.io) server (stdio) that gives an AI assist
 | `delete_task` | Deletes a task (optional ETag check) |
 | `import_ics` | Stores raw iCalendar data containing an event or a task (`overwrite` lets it replace an existing one) |
 
+### Nextcloud Deck (optional)
+
+Enabled when `NEXTCLOUD_URL` is set (see [Configuration](#configuration)). Without it these tools are not listed and CalDAV works as before.
+
+| Tool | What it does |
+|---|---|
+| `deck_list_boards` | Lists Deck boards with their labels and users (people who can be assigned). `include_archived` adds archived boards. |
+| `deck_list_stacks` | Lists a board's stacks (columns) in board order, each with its cards: title, description, due date, labels, assignees. `archived: true` lists archived cards instead. |
+| `deck_get_card` | Fetches one card by `board` + `card_id` |
+| `deck_create_card` | Creates a card at the bottom of a stack: title, description (Markdown), due date, labels, assigned users |
+| `deck_update_card` | Changes only the fields you pass: title, description, due date (`""` removes it), archived, labels, assigned users |
+| `deck_move_card` | Moves a card to another stack and/or position (`position` 0 = top, default bottom) |
+| `deck_delete_card` | Deletes a card |
+
+`board` and `stack` accept an id or a title (case-insensitive). `stack` is optional on the card tools; without it the card is found by scanning the board. `labels` takes label ids or titles and replaces the card's labels; `assigned_users` takes Nextcloud user ids and replaces the assignees. A due date given as a plain date (`2026-11-20`) means 23:59 that day in `timezone`.
+
 You can give `calendar` as a URL from `list_calendars` or as a display name (e.g. `"Work"`).
 
 Date/time formats: `2026-11-05` (all-day), `2026-11-05T10:00` (local time, uses `timezone`), `2026-11-05T10:00:00+01:00` / `...Z` (absolute).
@@ -33,6 +49,8 @@ Date/time formats: `2026-11-05` (all-day), `2026-11-05T10:00` (local time, uses 
 | `CALDAV_DEFAULT_CALENDAR` | Default calendar name or URL |
 | `CALDAV_DEFAULT_TASK_LIST` | Default calendar for tasks. Without it, tasks go to `CALDAV_DEFAULT_CALENDAR` if that calendar supports tasks, otherwise to the first calendar that does. |
 | `CALDAV_TIMEZONE` | Default IANA timezone for local times, e.g. `Europe/Berlin` |
+| `NEXTCLOUD_URL` | Nextcloud server root, e.g. `https://cloud.example.com`. Enables the Deck tools. |
+| `NEXTCLOUD_USERNAME` / `NEXTCLOUD_PASSWORD` / `NEXTCLOUD_TOKEN` | Credentials for Deck. Default: the `CALDAV_*` credentials. |
 
 Example URLs:
 - Nextcloud: `https://cloud.example.com/remote.php/dav`
@@ -53,6 +71,7 @@ claude mcp add caldav \
   -e CALDAV_URL=https://cloud.example.com/remote.php/dav \
   -e CALDAV_USERNAME=me -e CALDAV_PASSWORD=app-password \
   -e CALDAV_TIMEZONE=Europe/Berlin \
+  -e NEXTCLOUD_URL=https://cloud.example.com \
   -- /path/to/caldav_mcp/target/release/caldav_mcp
 ```
 
